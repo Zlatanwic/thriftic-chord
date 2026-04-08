@@ -26,16 +26,15 @@ def in_interval(x: int, a: int, b: int,
     b = b % RING_SIZE
 
     if a == b:
-        if not inclusive_left and not inclusive_right:
-            return False
-        if inclusive_left and x == a:
-            return True
-        if inclusive_right and x == b:
-            return True
+        # a == b 时，区间覆盖整个环（可能排除端点）
+        # (a, a) 开开 -> 整个环除 a 本身
+        # [a, a) 或 (a, a] -> 整个环（a 被包含端覆盖）
+        # [a, a] -> 仅 a 本身
         if inclusive_left and inclusive_right:
             return x == a
-        # 半开区间覆盖整个环（除了 a 本身在非包含端）
-        return x != a if not inclusive_left else x != b if not inclusive_right else True
+        if x == a:
+            return inclusive_left or inclusive_right
+        return True
 
     if a < b:
         lower = a < x if not inclusive_left else a <= x
