@@ -1,0 +1,8 @@
+M = 8  # identifier 位数，环大小 2^8 = 256
+RING_SIZE = 2 ** M
+
+STABILIZE_INTERVAL = 1    # 秒
+FIX_FINGERS_INTERVAL = 3  # 秒
+CHECK_PREDECESSOR_INTERVAL = 5  # 秒
+
+RPC_TIMEOUT = 5000  # 毫秒
