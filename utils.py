@@ -1,6 +1,6 @@
 import hashlib
 
-from config import M, RING_SIZE
+from config import  RING_SIZE
 
 
 def consistent_hash(key: str) -> int:
@@ -41,12 +41,14 @@ def in_interval(x: int, a: int, b: int,
         upper = x < b if not inclusive_right else x <= b
         return lower and upper
     else:
-        # 跨 0 点: (a, 2^m) ∪ [0, b)
-        in_upper = a < x if not inclusive_left else a <= x
+        # 跨 0 点: (a, RING_SIZE) ∪ [0, b)
+        # 上部分 (a, RING_SIZE): x 必须 > a（不是 a < x！）
+        # 下部分 [0, b): x < b（右开）或 x <= b（右闭）
+        in_upper = x > a if not inclusive_left else x >= a
         in_lower = x < b if not inclusive_right else x <= b
-        # x > a 或 x < b
-        if in_upper and x < RING_SIZE:
+        if in_upper:
             return True
-        if in_lower and x >= 0:
+        if in_lower:
             return True
         return False
+

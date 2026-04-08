@@ -241,9 +241,94 @@ class ChordNode:
                 with self._lock:
                     self.predecessor = None
 
+    def init_finger_table(self) -> None:
+        """初始化 finger table：每一项都通过 find_successor 确定真正的 successor。"""
+        with self._lock:
+            for i in range(M):
+                start = self.finger_table[i]["start"]
+                # 复用本地 find_successor 逻辑，不发 RPC
+                n_prime = self
+                while True:
+                    succ = self._get_successor_internal(n_prime)
+                    # 判断 id 是否在 (n_prime, successor] 区间内
+                    if in_interval(start, n_prime.node_id, succ.node_id,
+                                   inclusive_left=False, inclusive_right=True):
+                        self.finger_table[i]["node"] = succ
+                        break
+                    # 否则跳到 closest preceding finger
+                    cpf = self._closest_preceding_finger_internal(start, n_prime)
+                    if cpf.node_id == n_prime.node_id:
+                        # 无法前进，使用 successor
+                        self.finger_table[i]["node"] = succ
+                        break
+                    n_prime = cpf
+                logger.debug(f"finger[{i}] start={start} -> node={self.finger_table[i]['node'].node_id}")
+
+    def _get_successor_internal(self, node_info: "chord_thrift.NodeInfo") -> "chord_thrift.NodeInfo":
+        """获取指定 node 的 successor（内部使用，不加锁）。"""
+        if node_info.node_id == self.node_id:
+            return self.successor
+        try:
+            client = rpc_call(node_info.host, node_info.port)
+            result = client.get_successor()
+            client._iprot.trans.close()
+            return result
+        except Exception as e:
+            logger.warning(f"_get_successor_internal failed: {e}")
+            return self.successor
+
+    def _closest_preceding_finger_internal(self, id: int,
+                                          node_info: "chord_thrift.NodeInfo") -> "chord_thrift.NodeInfo":
+        """获取指定 node 的 closest preceding finger（内部使用，不加锁）。"""
+        if node_info.node_id == self.node_id:
+            for i in range(M - 1, -1, -1):
+                finger_node = self.finger_table[i]["node"]
+                if in_interval(finger_node.node_id, self.node_id, id,
+                               inclusive_left=False, inclusive_right=False):
+                    return finger_node
+            return make_node_info(self.node_id, self.host, self.port)
+        try:
+            client = rpc_call(node_info.host, node_info.port)
+            result = client.closest_preceding_finger(id)
+            client._iprot.trans.close()
+            return result
+        except Exception as e:
+            logger.warning(f"_closest_preceding_finger_internal failed: {e}")
+            return make_node_info(self.node_id, self.host, self.port)
+
     # ========================
     # === Node 加入 ===
     # ========================
+
+    def update_finger_table(self, s: "chord_thrift.NodeInfo", i: int) -> None:
+        """被其他 node 调用：尝试将 finger[i] 更新为 s，并递归向前传播。"""
+        with self._lock:
+            finger_i_node = self.finger_table[i]["node"]
+
+        # 判断 s 是否落在 [self, finger_i_node) 区间（左闭右开）
+        if in_interval(s.node_id, self.node_id, finger_i_node.node_id,
+                       inclusive_left=True, inclusive_right=False):
+            with self._lock:
+                self.finger_table[i]["node"] = s
+            # 递归向前传播
+            if self.predecessor is not None and self.predecessor.node_id != self.node_id:
+                try:
+                    client = rpc_call(self.predecessor.host, self.predecessor.port)
+                    client.update_finger_table(s, i)
+                    client._iprot.trans.close()
+                except Exception as e:
+                    logger.warning(f"update_finger_table propagate failed: {e}")
+
+    def update_others(self) -> None:
+        """通知所有需要将本 node 加入 finger table 的已有 node。"""
+        for i in range(M):
+            p_id = (self.node_id - (2 ** i)) % RING_SIZE
+            try:
+                p = self.find_predecessor(p_id)
+                if p.node_id != self.node_id:
+                    p.update_finger_table(make_node_info(self.node_id, self.host, self.port), i)
+            except Exception as e:
+                logger.warning(f"update_others i={i} failed: {e}")
 
     def join(self, known_host: str, known_port: int) -> None:
         """通过已知 node 加入 Chord 环。"""
@@ -254,9 +339,32 @@ class ChordNode:
             self.finger_table[0]["node"] = self.successor
             client._iprot.trans.close()
             logger.info(f"Joined via {known_host}:{known_port}, successor={self.successor.node_id}")
+            # 初始化完整 finger table
+            self.init_finger_table()
+            # 通知其他 node 更新 finger table
+            self.update_others()
+            # 从 successor 迁移属于本 node 的 keys
+            self._migrate_from_successor()
         except Exception as e:
             logger.error(f"Join failed: {e}")
             raise
+
+    def _migrate_from_successor(self) -> None:
+        """从 successor 迁移 (predecessor, self.node_id] 区间的 keys。"""
+        if self.successor.node_id == self.node_id:
+            return
+        try:
+            client = rpc_call(self.successor.host, self.successor.port)
+            transferred = client.transfer_keys(self.predecessor.node_id if self.predecessor else self.node_id,
+                                              self.node_id)
+            client._iprot.trans.close()
+            with self._lock:
+                for key, value in transferred.items():
+                    self.data[key] = value
+            if transferred:
+                logger.info(f"Migrated {len(transferred)} keys from successor {self.successor.node_id}")
+        except Exception as e:
+            logger.warning(f"_migrate_from_successor failed: {e}")
 
     def start_background_tasks(self) -> None:
         """启动三个后台 daemon 线程。"""
@@ -265,17 +373,62 @@ class ChordNode:
             t.start()
 
     # ========================
-    # === 数据存取（Phase 3，先留桩）===
+    # === 数据存取（Phase 3）===
     # ========================
 
     def put(self, key: str, value: str) -> None:
-        pass
+        """存储 key-value。先通过 find_successor 找到负责的 node，再转发。"""
+        key_id = consistent_hash(key)
+        target = self.find_successor(key_id)
+        if target.node_id == self.node_id:
+            with self._lock:
+                self.data[key] = value
+            logger.info(f"put key={key} (id={key_id}) -> local store")
+        else:
+            try:
+                client = rpc_call(target.host, target.port)
+                client.put(key, value)
+                client._iprot.trans.close()
+                logger.info(f"put key={key} (id={key_id}) -> forward to node {target.node_id}")
+            except Exception as e:
+                logger.error(f"put forward failed: {e}")
+                raise
 
     def get(self, key: str) -> "chord_thrift.GetResult":
-        return chord_thrift.GetResult(found=False, value="")
+        """读取 key。先通过 find_successor 找到负责的 node，再转发。"""
+        key_id = consistent_hash(key)
+        target = self.find_successor(key_id)
+        if target.node_id == self.node_id:
+            with self._lock:
+                if key in self.data:
+                    return chord_thrift.GetResult(found=True, value=self.data[key])
+                return chord_thrift.GetResult(found=False, value="")
+        else:
+            try:
+                client = rpc_call(target.host, target.port)
+                result = client.get(key)
+                client._iprot.trans.close()
+                return result
+            except Exception as e:
+                logger.error(f"get forward failed: {e}")
+                return chord_thrift.GetResult(found=False, value="")
 
     def transfer_keys(self, from_id: int, to_id: int) -> dict:
-        return {}
+        """将 (from_id, to_id] 区间内的所有 key 迁移出去，返回待迁移的 kv 对。"""
+        to_transfer = {}
+        with self._lock:
+            keys_to_remove = []
+            for key in self.data:
+                key_id = consistent_hash(key)
+                if in_interval(key_id, from_id, to_id,
+                               inclusive_left=False, inclusive_right=True):
+                    to_transfer[key] = self.data[key]
+                    keys_to_remove.append(key)
+            for key in keys_to_remove:
+                del self.data[key]
+        if to_transfer:
+            logger.info(f"transfer_keys ({from_id}, {to_id}]: {len(to_transfer)} keys")
+        return to_transfer
 
     # ========================
     # === 运维 ===
