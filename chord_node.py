@@ -1,12 +1,15 @@
+import json
 import threading
 import time
 import logging
 
+import numpy as np
 import thriftpy2
 from thriftpy2.rpc import make_client
 
 from config import M, RING_SIZE, STABILIZE_INTERVAL, FIX_FINGERS_INTERVAL, CHECK_PREDECESSOR_INTERVAL, RPC_TIMEOUT
 from utils import consistent_hash, in_interval
+from embedding import cosine_similarity, from_json
 
 chord_thrift = thriftpy2.load("chord.thrift", module_name="chord_thrift")
 
@@ -48,6 +51,8 @@ class ChordNode:
             })
 
         self.data = {}
+        # Phase 5: 向量存储 — doc_id -> {text, embedding(np.ndarray)}
+        self.vector_store: dict[str, dict] = {}
         self._lock = threading.RLock()
 
         logger.info(f"Node created: id={self.node_id}, addr={host}:{port}")
@@ -429,6 +434,83 @@ class ChordNode:
         if to_transfer:
             logger.info(f"transfer_keys ({from_id}, {to_id}]: {len(to_transfer)} keys")
         return to_transfer
+
+    # ========================
+    # === Phase 5: AI 向量搜索 ===
+    # ========================
+
+    def put_document(self, doc_id: str, text: str, embedding_json: str) -> None:
+        """存储文档及其 embedding 向量。
+
+        文档按 doc_id 的哈希路由到负责的 node（与 put 相同逻辑）。
+        embedding_json 是客户端预计算好的向量的 JSON 序列化。
+        """
+        key_id = consistent_hash(doc_id)
+        target = self.find_successor(key_id)
+        if target.node_id == self.node_id:
+            embedding = from_json(embedding_json)
+            with self._lock:
+                self.vector_store[doc_id] = {"text": text, "embedding": embedding}
+            logger.info(f"put_document doc_id={doc_id!r} (id={key_id}) -> local, "
+                        f"total docs={len(self.vector_store)}")
+        else:
+            try:
+                client = rpc_call(target.host, target.port)
+                client.put_document(doc_id, text, embedding_json)
+                client._iprot.trans.close()
+                logger.info(f"put_document doc_id={doc_id!r} -> forward to node {target.node_id}")
+            except Exception as e:
+                logger.error(f"put_document forward failed: {e}")
+                raise
+
+    def local_search(self, query_embedding_json: str, top_k: int) -> list:
+        """在本 node 存储的文档中，按余弦相似度返回 top_k 个最相似的结果。
+
+        这是 scatter-gather 的 scatter 侧：
+        客户端并发调用所有 node 的 local_search，然后在客户端 merge。
+        """
+        query_vec = from_json(query_embedding_json)
+        results = []
+        with self._lock:
+            for doc_id, entry in self.vector_store.items():
+                score = cosine_similarity(query_vec, entry["embedding"])
+                results.append((doc_id, entry["text"], score))
+
+        # 按相似度降序排序，取 top_k
+        results.sort(key=lambda x: x[2], reverse=True)
+        results = results[:top_k]
+
+        return [
+            chord_thrift.SearchResult(doc_id=doc_id, text=text, score=score)
+            for doc_id, text, score in results
+        ]
+
+    def get_all_nodes(self) -> list:
+        """遍历 successor 链，返回环上所有 node 的信息。
+
+        用于 scatter-gather 搜索时，客户端需要知道所有 node 地址。
+        """
+        nodes = []
+        with self._lock:
+            start_id = self.node_id
+            nodes.append(make_node_info(self.node_id, self.host, self.port))
+            current = self.successor
+
+        # 沿 successor 链遍历直到回到起点
+        visited = {start_id}
+        while current.node_id not in visited:
+            visited.add(current.node_id)
+            nodes.append(current)
+            try:
+                client = rpc_call(current.host, current.port)
+                next_node = client.get_successor()
+                client._iprot.trans.close()
+                current = next_node
+            except Exception as e:
+                logger.warning(f"get_all_nodes: failed to reach {current.node_id}: {e}")
+                break
+
+        return nodes
 
     # ========================
     # === 运维 ===

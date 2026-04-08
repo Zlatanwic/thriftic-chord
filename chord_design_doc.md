@@ -434,6 +434,61 @@ thriftpy2 的 `make_server` 默认使用 `TThreadedServer`，每个请求一个�
 - node 离开时的优雅退出（主动迁移数据 + 通知邻居）
 - 数据副本：在 successor list 的 node 上冗余存储
 
+### Phase 5：分布式语义向量搜索 + RAG（AI 扩展）
+
+**目标**：在 Chord DHT 上构建分布式向量存储，支持语义搜索和 RAG 问答。
+
+**核心思路**：Chord 环不仅存储 KV 数据，还存储文档的嵌入向量（embedding）。语义搜索采用 Scatter-Gather 模式：
+
+```
+                    ┌───────────┐
+                    │ AI Client │
+                    │ (query)   │
+                    └─────┬─────┘
+                          │ 1. encode(query) → vector
+                          │ 2. get_all_nodes()
+                    ┌─────┴─────┐
+           scatter  │           │  scatter
+         ┌─────────┼───────────┼─────────┐
+         ▼         ▼           ▼         ▼
+    ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+    │ Node A  │ │ Node B  │ │ Node C  │ │ Node D  │
+    │local_   │ │local_   │ │local_   │ │local_   │
+    │search() │ │search() │ │search() │ │search() │
+    └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘
+         │           │           │           │
+         └───────────┴─────┬─────┴───────────┘
+                           │ gather: merge top-k
+                    ┌──────┴──────┐
+                    │  AI Client  │
+                    │ (results)   │
+                    │ + LLM call  │
+                    └─────────────┘
+```
+
+**新增接口**：
+
+| RPC | 说明 |
+|-----|------|
+| `put_document(doc_id, text, embedding_json)` | 存储文档及其向量，按 hash(doc_id) 路由 |
+| `local_search(query_embedding_json, top_k)` | 本 node 上的局部向量相似搜索 |
+| `get_all_nodes()` | 遍历 successor 链，返回环上所有 node |
+
+**新增文件**：
+
+| 文件 | 职责 |
+|------|------|
+| `embedding.py` | 文本嵌入：sentence-transformers (高质量) 或 trigram fallback (零依赖) |
+| `ai_client.py` | AI 客户端 CLI：store-doc / search / rag 三个命令 |
+| `sample_docs.jsonl` | 示例文档集（Chord/DHT/RAG 相关知识） |
+
+**RAG 流程**：
+
+1. 用户提问 → 计算 query embedding
+2. Scatter：并发调用所有 node 的 `local_search()`
+3. Gather：合并所有 node 返回的结果，取全局 top-k
+4. 将检索到的文档拼入 prompt，调用 LLM 生成回答
+
 ---
 
 ## 9. 测试策略
