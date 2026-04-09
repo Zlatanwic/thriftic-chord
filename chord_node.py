@@ -7,7 +7,7 @@ import numpy as np
 import thriftpy2
 from thriftpy2.rpc import make_client
 
-from config import M, RING_SIZE, STABILIZE_INTERVAL, FIX_FINGERS_INTERVAL, CHECK_PREDECESSOR_INTERVAL, RPC_TIMEOUT
+from config import M, RING_SIZE, SUCCESSOR_LIST_SIZE, STABILIZE_INTERVAL, FIX_FINGERS_INTERVAL, CHECK_PREDECESSOR_INTERVAL, RPC_TIMEOUT
 from utils import consistent_hash, in_interval
 from embedding import cosine_similarity, from_json
 
@@ -51,6 +51,10 @@ class ChordNode:
             })
 
         self.data = {}
+        # Phase 4: successor list（容错）
+        self.successor_list: list = [make_node_info(self.node_id, host, port)]
+        # Phase 4: 副本数据（从 predecessor 复制来的，用于容错恢复）
+        self.replica_data: dict[str, str] = {}
         # Phase 5: 向量存储 — doc_id -> {text, embedding(np.ndarray)}
         self.vector_store: dict[str, dict] = {}
         self._lock = threading.RLock()
@@ -62,21 +66,26 @@ class ChordNode:
     # ========================
 
     def find_successor(self, id: int) -> "chord_thrift.NodeInfo":
-        """找到 identifier id 的 successor node。"""
-        n_prime = self.find_predecessor(id)
-        # 如果 predecessor 是自己，直接返回自己的 successor
-        if n_prime.node_id == self.node_id:
-            with self._lock:
-                return self.successor
-        # 否则 RPC 获取 n_prime 的 successor
+        """找到 identifier id 的 successor node。失败时回退到 successor list。"""
         try:
+            n_prime = self.find_predecessor(id)
+            if n_prime.node_id == self.node_id:
+                with self._lock:
+                    return self.successor
             client = rpc_call(n_prime.host, n_prime.port)
             result = client.get_successor()
             client._iprot.trans.close()
             return result
         except Exception as e:
             logger.error(f"find_successor RPC failed: {e}")
+            # 回退：在 successor list 中找一个存活的节点
             with self._lock:
+                for node in self.successor_list:
+                    if node.node_id == self.node_id:
+                        continue
+                    if in_interval(id, self.node_id, node.node_id,
+                                   inclusive_left=False, inclusive_right=True):
+                        return node
                 return self.successor
 
     def find_predecessor(self, id: int) -> "chord_thrift.NodeInfo":
@@ -174,23 +183,27 @@ class ChordNode:
                 self.predecessor = candidate
 
     def _stabilize(self) -> None:
-        """后台周期任务：检查并修复 successor。"""
+        """后台周期任务：检查并修复 successor，维护 successor list。"""
         while True:
             time.sleep(STABILIZE_INTERVAL)
             try:
                 with self._lock:
                     succ = self.successor
 
+                # 检测 successor 是否存活，若宕机则从 successor list 中找替代
+                if succ.node_id != self.node_id:
+                    if not self._is_alive(succ):
+                        self._handle_successor_failure()
+                        continue
+
                 # 获取 successor 的 predecessor
                 if succ.node_id == self.node_id:
-                    # successor 是自己，取本地 predecessor
                     with self._lock:
                         x = self.predecessor
                 else:
                     client = rpc_call(succ.host, succ.port)
                     x = client.get_predecessor()
                     client._iprot.trans.close()
-                    # get_predecessor 返回 node_id=-1 表示 None
                     if x.node_id == -1:
                         x = None
 
@@ -211,6 +224,12 @@ class ChordNode:
                     client = rpc_call(succ.host, succ.port)
                     client.notify(me)
                     client._iprot.trans.close()
+
+                # 更新 successor list
+                self._update_successor_list()
+
+                # 复制数据到 successor list 节点
+                self._replicate_data()
 
             except Exception as e:
                 logger.debug(f"stabilize error: {e}")
@@ -245,6 +264,176 @@ class ChordNode:
                 logger.info(f"Predecessor {pred.node_id} failed, setting to None")
                 with self._lock:
                     self.predecessor = None
+
+    # ========================
+    # === Phase 4: 容错 ===
+    # ========================
+
+    def _is_alive(self, node_info: "chord_thrift.NodeInfo") -> bool:
+        """检测目标节点是否存活。"""
+        try:
+            client = rpc_call(node_info.host, node_info.port)
+            client.ping()
+            client._iprot.trans.close()
+            return True
+        except Exception:
+            return False
+
+    def _handle_successor_failure(self) -> None:
+        """当 successor 宕机时，从 successor list 中找到第一个存活的节点作为新 successor。"""
+        with self._lock:
+            old_succ = self.successor
+            candidates = list(self.successor_list)
+
+        logger.info(f"Successor {old_succ.node_id} failed, searching successor list for replacement")
+
+        for candidate in candidates:
+            if candidate.node_id == self.node_id:
+                continue
+            if candidate.node_id == old_succ.node_id:
+                continue
+            if self._is_alive(candidate):
+                with self._lock:
+                    self.successor = candidate
+                    self.finger_table[0]["node"] = candidate
+                    logger.info(f"Successor replaced: {old_succ.node_id} -> {candidate.node_id}")
+                # 将 replica_data 合并到本地 data（继承宕机节点的数据）
+                with self._lock:
+                    if self.replica_data:
+                        self.data.update(self.replica_data)
+                        logger.info(f"Recovered {len(self.replica_data)} keys from replica")
+                        self.replica_data.clear()
+                return
+
+        # 所有候选都不可达，回退到自己
+        with self._lock:
+            me = make_node_info(self.node_id, self.host, self.port)
+            self.successor = me
+            self.finger_table[0]["node"] = me
+            self.successor_list = [me]
+            logger.warning("All successors failed, pointing to self")
+
+    def _update_successor_list(self) -> None:
+        """从 successor 获取其 successor list，拼接成本节点的 successor list。"""
+        with self._lock:
+            succ = self.successor
+
+        if succ.node_id == self.node_id:
+            with self._lock:
+                self.successor_list = [make_node_info(self.node_id, self.host, self.port)]
+            return
+
+        try:
+            client = rpc_call(succ.host, succ.port)
+            succ_list = client.get_successor_list()
+            client._iprot.trans.close()
+
+            # 本节点的 successor list = [successor] + successor 的 list 的前 R-1 项
+            new_list = [succ] + list(succ_list)[:SUCCESSOR_LIST_SIZE - 1]
+            with self._lock:
+                self.successor_list = new_list
+        except Exception as e:
+            logger.debug(f"_update_successor_list failed: {e}")
+
+    def _replicate_data(self) -> None:
+        """将本节点负责的数据复制到 successor list 中的节点。"""
+        with self._lock:
+            if not self.data:
+                return
+            data_copy = dict(self.data)
+            succ_list = list(self.successor_list)
+
+        for node in succ_list:
+            if node.node_id == self.node_id:
+                continue
+            try:
+                client = rpc_call(node.host, node.port)
+                client.replicate_keys(data_copy)
+                client._iprot.trans.close()
+            except Exception as e:
+                logger.debug(f"_replicate_data to {node.node_id} failed: {e}")
+
+    def _replicate_single_key(self, key: str, value: str) -> None:
+        """将单个 key 复制到 successor list 中的节点。"""
+        with self._lock:
+            succ_list = list(self.successor_list)
+        for node in succ_list:
+            if node.node_id == self.node_id:
+                continue
+            try:
+                client = rpc_call(node.host, node.port)
+                client.replicate_keys({key: value})
+                client._iprot.trans.close()
+            except Exception:
+                pass
+
+    def get_successor_list(self) -> list:
+        """返回本节点的 successor list。"""
+        with self._lock:
+            return list(self.successor_list)
+
+    def replicate_keys(self, keys: dict) -> None:
+        """接收副本数据，存入 replica_data。"""
+        with self._lock:
+            self.replica_data.update(keys)
+
+    def remove_replicated_keys(self, keys: list) -> None:
+        """删除副本数据中的指定 key。"""
+        with self._lock:
+            for key in keys:
+                self.replica_data.pop(key, None)
+
+    def leave(self) -> None:
+        """优雅离开：将数据迁移给 successor，通知 predecessor 和 successor 更新指针。"""
+        with self._lock:
+            succ = self.successor
+            pred = self.predecessor
+            data_copy = dict(self.data)
+
+        logger.info(f"Node {self.node_id} leaving the ring...")
+
+        # 1. 将所有数据迁移给 successor
+        if succ.node_id != self.node_id and data_copy:
+            try:
+                client = rpc_call(succ.host, succ.port)
+                for key, value in data_copy.items():
+                    client.put(key, value)
+                client._iprot.trans.close()
+                logger.info(f"Migrated {len(data_copy)} keys to successor {succ.node_id}")
+            except Exception as e:
+                logger.error(f"leave: data migration failed: {e}")
+
+        # 2. 通知 successor 更新 predecessor
+        if succ.node_id != self.node_id and pred is not None:
+            try:
+                client = rpc_call(succ.host, succ.port)
+                client.notify(pred)
+                client._iprot.trans.close()
+            except Exception as e:
+                logger.warning(f"leave: notify successor failed: {e}")
+
+        # 3. 通知 predecessor 更新 successor
+        if pred is not None and pred.node_id != self.node_id:
+            try:
+                # predecessor 的 stabilize 会自动发现新 successor
+                # 这里通过清理副本加速过程
+                client = rpc_call(pred.host, pred.port)
+                client.remove_replicated_keys(list(data_copy.keys()))
+                client._iprot.trans.close()
+            except Exception as e:
+                logger.warning(f"leave: cleanup predecessor replicas failed: {e}")
+
+        # 4. 清理本地状态
+        with self._lock:
+            self.data.clear()
+            self.replica_data.clear()
+            self.predecessor = None
+            me = make_node_info(self.node_id, self.host, self.port)
+            self.successor = me
+            self.finger_table[0]["node"] = me
+            self.successor_list = [me]
+
+        logger.info(f"Node {self.node_id} has left the ring")
 
     def init_finger_table(self) -> None:
         """初始化 finger table：每一项都通过 find_successor 确定真正的 successor。"""
@@ -344,6 +533,9 @@ class ChordNode:
             self.finger_table[0]["node"] = self.successor
             client._iprot.trans.close()
             logger.info(f"Joined via {known_host}:{known_port}, successor={self.successor.node_id}")
+            # 初始化 successor list
+            self.successor_list = [self.successor]
+            self._update_successor_list()
             # 初始化完整 finger table
             self.init_finger_table()
             # 通知其他 node 更新 finger table
@@ -382,13 +574,16 @@ class ChordNode:
     # ========================
 
     def put(self, key: str, value: str) -> None:
-        """存储 key-value。先通过 find_successor 找到负责的 node，再转发。"""
+        """存储 key-value。先通过 find_successor 找到负责的 node，再转发。
+        存储后异步复制到 successor list 节点。"""
         key_id = consistent_hash(key)
         target = self.find_successor(key_id)
         if target.node_id == self.node_id:
             with self._lock:
                 self.data[key] = value
             logger.info(f"put key={key} (id={key_id}) -> local store")
+            # 立即复制到 successor list
+            self._replicate_single_key(key, value)
         else:
             try:
                 client = rpc_call(target.host, target.port)
@@ -400,13 +595,17 @@ class ChordNode:
                 raise
 
     def get(self, key: str) -> "chord_thrift.GetResult":
-        """读取 key。先通过 find_successor 找到负责的 node，再转发。"""
+        """读取 key。先通过 find_successor 找到负责的 node，再转发。
+        如果目标 node 不可达，尝试从本地 replica 中读取。"""
         key_id = consistent_hash(key)
         target = self.find_successor(key_id)
         if target.node_id == self.node_id:
             with self._lock:
                 if key in self.data:
                     return chord_thrift.GetResult(found=True, value=self.data[key])
+                # 尝试 replica
+                if key in self.replica_data:
+                    return chord_thrift.GetResult(found=True, value=self.replica_data[key])
                 return chord_thrift.GetResult(found=False, value="")
         else:
             try:
@@ -416,6 +615,10 @@ class ChordNode:
                 return result
             except Exception as e:
                 logger.error(f"get forward failed: {e}")
+                # 回退：尝试从本地 replica 中读取
+                with self._lock:
+                    if key in self.replica_data:
+                        return chord_thrift.GetResult(found=True, value=self.replica_data[key])
                 return chord_thrift.GetResult(found=False, value="")
 
     def transfer_keys(self, from_id: int, to_id: int) -> dict:

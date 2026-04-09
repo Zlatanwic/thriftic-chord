@@ -43,6 +43,19 @@ service ChordService {
 
     bool ping(),
 
+    // === Phase 4: 容错 ===
+    // 获取 successor list（多个后继用于容错）
+    list<NodeInfo> get_successor_list(),
+
+    // 优雅离开：主动迁移数据并通知邻居
+    void leave(),
+
+    // 接收副本数据（successor list 节点冗余存储）
+    void replicate_keys(1: map<string,string> keys),
+
+    // 删除副本数据（节点离开时清理）
+    void remove_replicated_keys(1: list<string> keys),
+
     // === Phase 5: AI 向量搜索 ===
     // 存储文档及其 embedding 向量（embedding 序列化为 JSON 字符串）
     void put_document(1: string doc_id, 2: string text, 3: string embedding_json),

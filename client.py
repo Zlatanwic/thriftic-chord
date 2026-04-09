@@ -67,6 +67,14 @@ def cmd_lookup(host: str, port: int, key: str):
     print(f"key={key!r} (id={key_id}) -> node={target.node_id} ({target.host}:{target.port})")
 
 
+def cmd_leave(host: str, port: int):
+    """通知 node 优雅离开 Chord 环。"""
+    client = get_client(host, port)
+    client.leave()
+    client._iprot.trans.close()
+    print(f"OK: node {host}:{port} has left the ring")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Chord DHT Client")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -83,6 +91,8 @@ def main():
     l = sub.add_parser("lookup", help="Show which node is responsible for a key")
     l.add_argument("key", help="Key")
 
+    sub.add_parser("leave", help="Gracefully remove node from the ring")
+
     parser.add_argument("--node", required=True, help="Node address, e.g. 127.0.0.1:6001")
     args = parser.parse_args()
 
@@ -96,6 +106,8 @@ def main():
         cmd_status(host, port)
     elif args.cmd == "lookup":
         cmd_lookup(host, port, args.key)
+    elif args.cmd == "leave":
+        cmd_leave(host, port)
 
 
 if __name__ == "__main__":
